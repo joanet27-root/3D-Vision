@@ -12,32 +12,32 @@ IMAGE_EXT = "*.jpg"
 
 ARUCO_DICT_NAME = cv2.aruco.DICT_4X4_50
 
-# IDs de los 4 ArUco usados
+# IDs fijados siempre a la misma referencia lógica
 ARUCO_IDS = {
-    "tl": 21,
-    "tr": 23,
-    "br": 22,
-    "bl": 20
+    "tl": 23,
+    "tr": 22,
+    "br": 20,
+    "bl": 21
 }
 
-# Tamaño real del marcador en las unidades que quieras
-# (mm, cm, etc.). Sé consistente.
-# Tamaño real del marcador en mm
+# Tamaño real del lado del ArUco (mm)
 MARKER_SIZE = 100.0
 
-# Coordenadas aproximadas basadas en las dimensiones del campo (3000x2000 mm)
-# Nota: La normativa no define IDs fijos para las esquinas, 
-# los IDs 36 y 47 son para las piezas móviles (cajas).
-MARKER_POSITIONS = {
-    21: (0.0, 0.0),
-    23: (300.0, 0.0),
-    22: (300.0, 500.0),
-    20: (0.0, 500.0)
+# Sistema mundo FIJO del tablero
+# Usamos exactamente las coordenadas reales que indicas.
+# IMPORTANTE:
+# Estas coordenadas deben corresponder al punto TL del marcador
+# en el MISMO sistema de referencia para todos.
+
+MARKER_INFO = {
+    21: {"origin": (2450,1450), "rotation": 90},
+    23: {"origin": (2450,650),  "rotation": 90},
+    22: {"origin": (650,650),   "rotation": 90},
+    20: {"origin": (650,1450),  "rotation": 90},
 }
 
-# Si quieres exigir que estén los 4 ArUco siempre:
 REQUIRE_ALL_FOUR = True
-
+SAVE_DEBUG_CORNERS = True
 
 # =========================================================
 # DETECCIÓN ARUCO
@@ -56,43 +56,84 @@ def detect_arucos(image, aruco_dict_name):
     return corners, ids.flatten()
 
 
+def draw_aruco_corner_order(image, corners_list, ids):
+    img = image.copy()
+
+    if ids is None:
+        return img
+
+    for marker_corners, marker_id in zip(corners_list, ids):
+        corners = marker_corners.reshape(4, 2)
+
+        for i, (x, y) in enumerate(corners):
+            x, y = int(round(x)), int(round(y))
+            cv2.circle(img, (x, y), 6, (0, 0, 255), -1)
+            cv2.putText(
+                img, f"{i}", (x + 5, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2
+            )
+
+        center = np.mean(corners, axis=0).astype(int)
+        cv2.putText(
+            img, f"ID {int(marker_id)}", tuple(center),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+        )
+
+    return img
+
+
 # =========================================================
 # GEOMETRÍA DEL PLANO
 # =========================================================
 
+def rotate_corners(corners, k):
+    """
+    Rota la lista de esquinas en pasos de 90 grados.
+    k = 0,1,2,3  ->  0,90,180,270 grados
+    """
+    corners = np.asarray(corners, dtype=np.float64)
+    return np.roll(corners, -k, axis=0)
+
+
 def get_marker_world_corners(marker_id):
     """
-    Devuelve las 4 esquinas del marcador en el plano del tablero.
-    Orden asumido: top-left, top-right, bottom-right, bottom-left
+    Devuelve las 4 esquinas mundo del ArUco en orden compatible
+    con OpenCV: TL, TR, BR, BL en la imagen detectada.
     """
-    x0, y0 = MARKER_POSITIONS[marker_id]
+    info = MARKER_INFO[marker_id]
+    x0, y0 = info["origin"]
+    rot_deg = info["rotation"]
     s = MARKER_SIZE
 
-    return np.array([
+    # marcador sin rotación en el sistema del tablero
+    base_corners = np.array([
         [x0,     y0    ],   # TL
         [x0 + s, y0    ],   # TR
         [x0 + s, y0 + s],   # BR
         [x0,     y0 + s]    # BL
     ], dtype=np.float64)
 
+    k = (rot_deg // 90) % 4
+    return rotate_corners(base_corners, k)
 
-def get_correspondences_from_image(image):
+
+def get_correspondences_from_image(image, image_name="debug"):
     """
     Devuelve:
     - world_pts: puntos del plano (Nx2)
     - image_pts: puntos de imagen (Nx2)
-
-    Usa las 4 esquinas de cada ArUco detectado.
     """
     corners_list, ids = detect_arucos(image, ARUCO_DICT_NAME)
+
+    if SAVE_DEBUG_CORNERS:
+        debug_img = draw_aruco_corner_order(image, corners_list, ids)
+        cv2.imwrite(f"debug_corners_{image_name}.jpg", debug_img)
 
     if ids is None:
         return None, None
 
     ids = [int(i) for i in ids]
-
     required_ids = list(ARUCO_IDS.values())
-    detected_required = [i for i in ids if i in required_ids]
 
     if REQUIRE_ALL_FOUR:
         missing = [mid for mid in required_ids if mid not in ids]
@@ -106,13 +147,9 @@ def get_correspondences_from_image(image):
         if marker_id not in required_ids:
             continue
 
-        # OpenCV devuelve shape (1,4,2), lo pasamos a (4,2)
         img_corners = marker_corners.reshape(4, 2).astype(np.float64)
-
-        # Esquinas reales del marcador en el plano
         obj_corners = get_marker_world_corners(marker_id)
 
-        # Añadimos las 4 correspondencias
         for obj_p, img_p in zip(obj_corners, img_corners):
             world_pts.append(obj_p)
             image_pts.append(img_p)
@@ -128,19 +165,13 @@ def get_correspondences_from_image(image):
 # =========================================================
 
 def normalize_points_2d(pts):
-    """
-    Normalización de Hartley para mejorar estabilidad numérica.
-    """
     pts = np.asarray(pts, dtype=np.float64)
     centroid = np.mean(pts, axis=0)
 
     shifted = pts - centroid
-    mean_dist = np.mean(np.sqrt(np.sum(shifted**2, axis=1)))
+    mean_dist = np.mean(np.sqrt(np.sum(shifted ** 2, axis=1)))
 
-    if mean_dist < 1e-12:
-        scale = 1.0
-    else:
-        scale = np.sqrt(2) / mean_dist
+    scale = 1.0 if mean_dist < 1e-12 else np.sqrt(2) / mean_dist
 
     T = np.array([
         [scale, 0, -scale * centroid[0]],
@@ -158,7 +189,7 @@ def dlt_homography(world_pts, image_pts):
     """
     Calcula H tal que:
         x ~ H X
-    donde X son puntos del plano y x puntos de imagen.
+    donde X son puntos del plano mundo y x puntos en imagen.
     """
     world_pts = np.asarray(world_pts, dtype=np.float64)
     image_pts = np.asarray(image_pts, dtype=np.float64)
@@ -170,10 +201,9 @@ def dlt_homography(world_pts, image_pts):
     image_norm, T_img = normalize_points_2d(image_pts)
 
     A = []
-
     for (X, Y), (x, y) in zip(world_norm, image_norm):
-        A.append([-X, -Y, -1,  0,  0,  0, x*X, x*Y, x])
-        A.append([ 0,  0,  0, -X, -Y, -1, y*X, y*Y, y])
+        A.append([-X, -Y, -1,  0,  0,  0, x * X, x * Y, x])
+        A.append([ 0,  0,  0, -X, -Y, -1, y * X, y * Y, y])
 
     A = np.asarray(A, dtype=np.float64)
 
@@ -181,7 +211,6 @@ def dlt_homography(world_pts, image_pts):
     h = Vt[-1]
     H_norm = h.reshape(3, 3)
 
-    # Desnormalización
     H = np.linalg.inv(T_img) @ H_norm @ T_world
 
     if abs(H[2, 2]) > 1e-12:
@@ -195,16 +224,9 @@ def dlt_homography(world_pts, image_pts):
 # =========================================================
 
 def vij(H, i, j):
-    """
-    i, j en {1,2,3}
-    """
-    h1 = H[:, 0]
-    h2 = H[:, 1]
-    h3 = H[:, 2]
-
-    cols = [h1, h2, h3]
-    hi = cols[i - 1]
-    hj = cols[j - 1]
+    h = H.T
+    hi = h[i - 1]
+    hj = h[j - 1]
 
     return np.array([
         hi[0] * hj[0],
@@ -217,16 +239,6 @@ def vij(H, i, j):
 
 
 def estimate_K_from_homographies(H_list):
-    """
-    Estima la matriz intrínseca K a partir de una lista de homografías
-    usando el método de Zhang.
-
-    Cada H debe mapear:
-        plano_del_mundo -> imagen
-
-    Devuelve:
-        K: matriz intrínseca 3x3
-    """
     V = []
 
     for H in H_list:
@@ -235,16 +247,27 @@ def estimate_K_from_homographies(H_list):
 
     V = np.asarray(V, dtype=np.float64)
 
-    # Resolver Vb = 0 con SVD
+    print("Número de H:", len(H_list))
+    print("Rango de V:", np.linalg.matrix_rank(V))
+    print("Valores singulares de V:", np.linalg.svd(V, compute_uv=False))
+
     _, _, Vt = np.linalg.svd(V)
     b = Vt[-1]
 
-    # La solución está definida salvo escala: b y -b son equivalentes
-    # Forzamos un signo consistente
+    print("b =", b)
+
     if b[0] < 0:
         b = -b
 
     B11, B12, B22, B13, B23, B33 = b
+
+    print("B11 =", B11)
+    print("B12 =", B12)
+    print("B22 =", B22)
+    print("B13 =", B13)
+    print("B23 =", B23)
+    print("B33 =", B33)
+    print("B11*B22 - B12^2 =", B11 * B22 - B12**2)
 
     denom = B11 * B22 - B12**2
     if abs(denom) < 1e-12:
@@ -253,15 +276,13 @@ def estimate_K_from_homographies(H_list):
         )
 
     v0 = (B12 * B13 - B11 * B23) / denom
-
     lam = B33 - (B13**2 + v0 * (B12 * B13 - B11 * B23)) / B11
 
-    # Si lambda sale negativa, probamos el signo opuesto
     if lam <= 0:
         b = -b
         B11, B12, B22, B13, B23, B33 = b
-
         denom = B11 * B22 - B12**2
+
         if abs(denom) < 1e-12:
             raise RuntimeError(
                 "Sistema degenerado al estimar K tras invertir el signo de b."
@@ -310,7 +331,6 @@ def estimate_extrinsics_from_H(K, H):
 
     R_approx = np.column_stack((r1, r2, r3))
 
-    # Ortonormalización por SVD
     U, _, Vt = np.linalg.svd(R_approx)
     R = U @ Vt
 
@@ -326,9 +346,6 @@ def estimate_extrinsics_from_H(K, H):
 # =========================================================
 
 def project_points_planar(K, R, t, world_pts):
-    """
-    world_pts: Nx2, asumimos Z=0
-    """
     projected = []
 
     for X, Y in world_pts:
@@ -344,9 +361,6 @@ def project_points_planar(K, R, t, world_pts):
 
 
 def reprojection_error(K, H_list, correspondences):
-    """
-    correspondences: lista de tuplas (world_pts, image_pts, image_name)
-    """
     all_errors = []
     per_image = []
 
@@ -383,7 +397,9 @@ def main():
             print(f"[WARN] No se pudo leer: {path}")
             continue
 
-        world_pts, image_pts = get_correspondences_from_image(image)
+        base_name = os.path.splitext(os.path.basename(path))[0]
+
+        world_pts, image_pts = get_correspondences_from_image(image, base_name)
 
         if world_pts is None or image_pts is None:
             print(f"[WARN] No se obtuvieron correspondencias válidas en: {path}")
