@@ -1,0 +1,308 @@
+import os
+import glob
+import json
+import cv2
+import numpy as np
+
+
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+
+INPUT_FOLDER = "frames_extraidos"
+IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg"]
+
+OUTPUT_FOLDER = "frames_con_arucos"
+OUTPUT_JSON = "arucos_detectados.json"
+
+ARUCO_DICT_NAME = cv2.aruco.DICT_4X4_50
+
+# IDs del tablero y su referencia lógica fija en el tablero
+BOARD_ARUCOS = {
+    23: "top_left",
+    21: "bottom_left",
+    22: "top_right",
+    20: "bottom_right"
+}
+
+# Si True, solo se aceptan imágenes donde estén los 4 ArUcos del tablero
+REQUIRE_ALL_FOUR = False
+
+# Refinamiento subpíxel
+USE_SUBPIX = True
+SUBPIX_WIN_SIZE = 5
+SUBPIX_ZERO_ZONE = -1
+SUBPIX_CRITERIA = (
+    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+    30,
+    0.001
+)
+
+
+# =========================================================
+# UTILIDADES
+# =========================================================
+
+def cargar_imagenes(input_folder, extensions):
+    image_paths = []
+    for ext in extensions:
+        image_paths.extend(glob.glob(os.path.join(input_folder, ext)))
+    return sorted(image_paths)
+
+
+def detectar_arucos(image, aruco_dict_name):
+    aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_name)
+    parameters = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+    corners, ids, rejected = detector.detectMarkers(image)
+
+    if ids is None or len(ids) == 0:
+        return [], None, rejected
+
+    return corners, ids.flatten(), rejected
+
+
+def refinar_esquinas_subpix(image, corners_list):
+    """
+    Refina las esquinas con cornerSubPix para mejorar precisión.
+    """
+    if not USE_SUBPIX or not corners_list:
+        return corners_list
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    refined = []
+
+    for marker_corners in corners_list:
+        pts = marker_corners.reshape(4, 1, 2).astype(np.float32)
+
+        cv2.cornerSubPix(
+            gray,
+            pts,
+            (SUBPIX_WIN_SIZE, SUBPIX_WIN_SIZE),
+            (SUBPIX_ZERO_ZONE, SUBPIX_ZERO_ZONE),
+            SUBPIX_CRITERIA
+        )
+
+        refined.append(pts.reshape(1, 4, 2))
+
+    return refined
+
+
+def filtrar_arucos_tablero(corners, ids):
+    """
+    Se queda solo con los 4 ArUcos del tablero.
+    """
+    if ids is None:
+        return [], None
+
+    filtered_corners = []
+    filtered_ids = []
+
+    for marker_corners, marker_id in zip(corners, ids):
+        marker_id = int(marker_id)
+        if marker_id in BOARD_ARUCOS:
+            filtered_corners.append(marker_corners)
+            filtered_ids.append(marker_id)
+
+    if len(filtered_ids) == 0:
+        return [], None
+
+    return filtered_corners, np.array(filtered_ids, dtype=np.int32)
+
+
+def dibujar_detecciones(image, corners, ids):
+    output = image.copy()
+
+    if ids is None or len(ids) == 0:
+        return output
+
+    cv2.aruco.drawDetectedMarkers(output, corners, ids)
+
+    for marker_corners, marker_id in zip(corners, ids):
+        pts = marker_corners.reshape(4, 2)
+
+        # Dibujar esquinas con su índice
+        for i, (x, y) in enumerate(pts):
+            x_i = int(round(x))
+            y_i = int(round(y))
+
+            cv2.circle(output, (x_i, y_i), 4, (0, 0, 255), -1)
+            cv2.putText(
+                output,
+                str(i),
+                (x_i + 5, y_i - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+        center = pts.mean(axis=0)
+        cx, cy = int(round(center[0])), int(round(center[1]))
+
+        role = BOARD_ARUCOS.get(int(marker_id), "unknown")
+
+        cv2.putText(
+            output,
+            f"ID {int(marker_id)}",
+            (cx, cy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            output,
+            role,
+            (cx, cy + 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    return output
+
+
+def corners_to_list(marker_corners):
+    pts = marker_corners.reshape(4, 2)
+    return [
+        {"corner_index": 0, "x": float(pts[0][0]), "y": float(pts[0][1])},
+        {"corner_index": 1, "x": float(pts[1][0]), "y": float(pts[1][1])},
+        {"corner_index": 2, "x": float(pts[2][0]), "y": float(pts[2][1])},
+        {"corner_index": 3, "x": float(pts[3][0]), "y": float(pts[3][1])},
+    ]
+
+
+def construir_registro_imagen(image_path, corners, ids):
+    image_record = {
+        "image_name": os.path.basename(image_path),
+        "image_path": image_path,
+        "num_arucos_detected_total": 0 if ids is None else int(len(ids)),
+        "num_board_arucos_detected": 0 if ids is None else int(len(ids)),
+        "has_all_four_board_arucos": False,
+        "board_arucos_present": [],
+        "arucos": []
+    }
+
+    if ids is None:
+        return image_record
+
+    present_ids = sorted([int(i) for i in ids])
+    image_record["board_arucos_present"] = present_ids
+
+    required_ids = sorted(list(BOARD_ARUCOS.keys()))
+    image_record["has_all_four_board_arucos"] = all(mid in present_ids for mid in required_ids)
+
+    for marker_corners, marker_id in zip(corners, ids):
+        marker_id = int(marker_id)
+        image_record["arucos"].append({
+            "id": marker_id,
+            "board_role": BOARD_ARUCOS.get(marker_id, "unknown"),
+            "corners": corners_to_list(marker_corners)
+        })
+
+    return image_record
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    image_paths = cargar_imagenes(INPUT_FOLDER, IMAGE_EXTENSIONS)
+
+    if not image_paths:
+        raise RuntimeError(f"No se encontraron imágenes en: {INPUT_FOLDER}")
+
+    resultados = {
+        "input_folder": INPUT_FOLDER,
+        "aruco_dictionary": "DICT_4X4_50",
+        "board_arucos": BOARD_ARUCOS,
+        "require_all_four": REQUIRE_ALL_FOUR,
+        "subpixel_refinement": USE_SUBPIX,
+        "images": []
+    }
+
+    total_board_markers = 0
+    total_images_with_all_four = 0
+
+    for image_path in image_paths:
+        image = cv2.imread(image_path)
+
+        if image is None:
+            print(f"[WARN] No se pudo leer: {image_path}")
+            continue
+
+        corners_all, ids_all, _ = detectar_arucos(image, ARUCO_DICT_NAME)
+
+        if ids_all is None:
+            image_record = {
+                "image_name": os.path.basename(image_path),
+                "image_path": image_path,
+                "num_arucos_detected_total": 0,
+                "num_board_arucos_detected": 0,
+                "has_all_four_board_arucos": False,
+                "board_arucos_present": [],
+                "arucos": []
+            }
+
+            image_drawn = image.copy()
+            output_image_path = os.path.join(OUTPUT_FOLDER, os.path.basename(image_path))
+            cv2.imwrite(output_image_path, image_drawn)
+            resultados["images"].append(image_record)
+
+            print(f"{os.path.basename(image_path)} -> 0 ArUcos detectados")
+            continue
+
+        # Refinamiento subpíxel
+        corners_all = refinar_esquinas_subpix(image, corners_all)
+
+        # Filtrar solo los del tablero
+        corners_board, ids_board = filtrar_arucos_tablero(corners_all, ids_all)
+
+        image_record = construir_registro_imagen(image_path, corners_board, ids_board)
+
+        if image_record["has_all_four_board_arucos"]:
+            total_images_with_all_four += 1
+
+        if ids_board is not None:
+            total_board_markers += len(ids_board)
+
+        # Si quieres exigir los 4, puedes saltarte el guardado lógico
+        if REQUIRE_ALL_FOUR and not image_record["has_all_four_board_arucos"]:
+            print(f"{os.path.basename(image_path)} -> descartada (no están los 4 ArUcos del tablero)")
+            continue
+
+        # Guardar imagen con detecciones dibujadas
+        image_drawn = dibujar_detecciones(image, corners_board, ids_board)
+        output_image_path = os.path.join(OUTPUT_FOLDER, os.path.basename(image_path))
+        cv2.imwrite(output_image_path, image_drawn)
+
+        resultados["images"].append(image_record)
+
+        print(
+            f"{os.path.basename(image_path)} -> "
+            f"{image_record['num_board_arucos_detected']} ArUcos del tablero detectados"
+        )
+
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(resultados, f, indent=4, ensure_ascii=False)
+
+    print("\nProceso terminado.")
+    print(f"Imágenes procesadas: {len(resultados['images'])}")
+    print(f"ArUcos del tablero detectados en total: {total_board_markers}")
+    print(f"Imágenes con los 4 ArUcos: {total_images_with_all_four}")
+    print(f"Imágenes con detecciones: {OUTPUT_FOLDER}")
+    print(f"JSON guardado en: {OUTPUT_JSON}")
+
+
+if __name__ == "__main__":
+    main()
